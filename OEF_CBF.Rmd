@@ -1,0 +1,299 @@
+---
+title: "CBF Standardization"
+author: "Krish Shah"
+date: "2023-10-11"
+output: html_document
+---
+
+Clear the environment and load in all required packages.
+
+```{r}
+rm(list=ls())
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(sjPlot)
+  library(tidyr)})
+```
+
+Read in TAP REDcap export.
+
+```{r}
+df <- read.csv("/Users/krishshah/Downloads/TAPElectronicDataCap-TAPPullASLWHR_DATA_2023-10-15_1301.csv")
+```
+
+Pre-processing TAP data. Make sure to add usability variable when it is available.
+
+```{r}
+df$session_id <- if_else(df$session_id=="",NA,df$session_id)
+merged_df <- df %>%
+  group_by(vmac_id, redcap_event_name) %>%
+  summarise_all(~ ifelse(all(is.na(.)), NA, na.omit(.)[1]))
+df <- merged_df
+colnames(df) <- gsub("_", ".", colnames(df))
+
+df$diagnosis.factor <- ifelse(df$diagnosis == 1, "Normal",
+                              ifelse(df$diagnosis == 2, "MCI",
+                                     ifelse(df$diagnosis == 3, "Dementia",
+                                            ifelse(df$diagnosis == 4, "Ambiguous At Risk", NA))))
+
+df$epoch <- ifelse(df$redcap.event.name == "enrollmentbaseline_arm_1", 1,
+                              ifelse(df$redcap.event.name == "1year_followup_arm_1", 2,
+                                     ifelse(df$redcap.event.name == "2year_followup_arm_1",
+                                            3,df$redcap.event.name)))
+
+
+df <- dplyr::filter(df,!is.na(asl.rest.grey.matter.hct))
+df <- df %>% 
+  dplyr::group_by(vmac.id) %>%
+  dplyr::arrange(epoch,.by_group = TRUE) %>% 
+  dplyr::filter(row_number()==1)
+
+
+table(df$diagnosis.factor)
+
+df$diagnosis.factor <- factor(df$diagnosis.factor,
+                              levels = c("Normal", "Ambiguous At Risk", "MCI", "Dementia"),
+                              ordered = F)
+
+
+df$diagnosis.factor.ordered <- factor(df$diagnosis.factor,
+                              levels = c("Normal", "Ambiguous At Risk", "MCI", "Dementia"),
+                              ordered = T)
+
+df$apoe <- ifelse(grepl("E4", df$alleles), "Yes", "No")
+
+df$apoe4pos.factor <- factor(df$apoe,
+                              levels = c("No", "Yes"),
+                              ordered = F)
+
+df$cdr.factor <- factor(df$cdrglob,
+                        levels = c(0,0.5,1,2,3),
+                        ordered = F)
+
+df$education <- df$educ
+df$sex.factor <- if_else(df$sex==1,"Male","Female")
+df$sex.factor <- as.factor(df$sex.factor)
+```
+
+Load in latest VMAP merge.
+
+```{r}
+df_vmap <- readRDS("/Users/krishshah/Downloads/MAP_fm_f20230906_m20230906.rds")
+```
+
+Pre-processing VMAP data and selecting first observation.
+
+```{r}
+df_vmap <- dplyr::filter(df_vmap,(epoch>=3 | map.id>=337))
+df_vmap <- filter(df_vmap, asl.rest.usable.hct.factor == "Yes")
+df_vmap <- df_vmap %>% 
+  dplyr::group_by(vmac.id) %>%
+  dplyr::arrange(epoch,.by_group = TRUE) %>% 
+  dplyr::filter(row_number()==1)
+```
+
+Merging VMAP and TAP data.
+
+```{r}
+df_tst <- plyr::rbind.fill(df,df_vmap)
+table(df_tst$cdr.factor)
+table(df_tst$diagnosis.factor)
+table(df_tst$apoe4pos.factor)
+```
+
+Selecting all variables of interest from merged dataframe.
+
+```{r}
+df_sel <- dplyr::select(df_tst,vmac.id,epoch,cdr.factor,age,sex.factor,education,asl.rest.pcu.precuneus.hct,
+                        diagnosis.factor, apoe4pos.factor, ma.total.intracranial.vol, raceethnicity.factor,
+                        asl.rest.putamen.hct, asl.rest.prg.precentral.gyrus.hct, asl.rest.hippocampus.hct,
+                        asl.rest.itg.inferior.temporal.gyrus.hct,
+                        asl.rest.po.parietal.operculum.hct, asl.rest.morg.medial.orbital.gyrus.hct,
+                        asl.rest.mfg.middle.frontal.gyrus.hct, asl.rest.grey.matter.hct.scov,
+                        np.cvlt.ldcr, np.cvlt.ldfr, np.inhibit, asl.rest.grey.matter.hct)
+```
+
+Dropping samples that are missing a variable.
+
+```{r}
+selected_columns <- c("cdr.factor", "age", "education", "asl.rest.pcu.precuneus.hct", "apoe4pos.factor", 
+                      "sex.factor", "asl.rest.putamen.hct", "asl.rest.grey.matter.hct")
+df_sel <- df_sel %>% drop_na(any_of(selected_columns))
+```
+
+Trinarize cdr.factor.
+```{r}
+table(df_sel$cdr.factor)
+
+df_sel$cdr.factor.trinarized <- droplevels(df_sel$cdr.factor)
+df_sel$cdr.factor.trinarized <- if_else(df_sel$cdr.factor.trinarized==2 | df_sel$cdr.factor.trinarized==3,factor(1, levels=levels(df_sel$cdr.factor.trinarized)),df_sel$cdr.factor.trinarized)
+df_sel$cdr.factor.trinarized <- droplevels(df_sel$cdr.factor.trinarized)
+
+table(df_sel$cdr.factor.trinarized)
+table(df_sel$cdr.factor.trinarized, df_sel$apoe4pos.factor)
+```
+
+Linear model for CBF precuneus and no residualization. Plot for main effects.
+
+```{r}
+mdl <- lm(asl.rest.pcu.precuneus.hct~cdr.factor.trinarized+apoe4pos.factor+age+sex.factor+education,data=df_sel)
+summary(mdl)
+plot_model(mdl, type='emm', terms='cdr.factor.trinarized')
+```
+
+Linear model for CBF precuneus and no residualization. Plot for interaction effects.
+```{r}
+mdl <- lm(asl.rest.pcu.precuneus.hct~cdr.factor.trinarized*apoe4pos.factor+age+sex.factor+education,data=df_sel)
+summary(mdl)
+plot_model(mdl, type='int')
+```
+
+Linear model for CBF precuenus with residualization using putamen as reference region. Plot for main effects.
+```{r}
+mdl <- lm(asl.rest.pcu.precuneus.hct~cdr.factor.trinarized+apoe4pos.factor+age+sex.factor+education+asl.rest.putamen.hct,data=df_sel)
+summary(mdl)
+plot_model(mdl, type='emm', terms='cdr.factor.trinarized')
+```
+
+Linear model for CBF precuneus with residualization using putamen as reference region. Plot for interaction effects.
+```{r}
+mdl <- lm(asl.rest.pcu.precuneus.hct~cdr.factor.trinarized*apoe4pos.factor+age+sex.factor+education+asl.rest.putamen.hct,data=df_sel)
+summary(mdl)
+plot_model(mdl, type='int')
+```
+
+Linear model for CBF precuneus with residualization using precentral gyrus as reference region. Plot for main effect.
+```{r}
+mdl <- lm(asl.rest.pcu.precuneus.hct~cdr.factor.trinarized+apoe4pos.factor+age+sex.factor+education+asl.rest.prg.precentral.gyrus.hct,data=df_sel)
+summary(mdl)
+plot_model(mdl, type='emm', terms='cdr.factor.trinarized')
+```
+
+Linear model for CBF precuneus with residualization using precentral gyrus as reference region. Plot for interaction effects.
+```{r}
+mdl <- lm(asl.rest.pcu.precuneus.hct~cdr.factor.trinarized*apoe4pos.factor+age+sex.factor+education+asl.rest.prg.precentral.gyrus.hct,data=df_sel)
+summary(mdl)
+plot_model(mdl, type='int')
+```
+
+Linear model for CBF precuneus/CBF putamen. Plot for main effects.
+```{r}
+mdl <- lm((asl.rest.pcu.precuneus.hct/asl.rest.putamen.hct)~cdr.factor.trinarized+apoe4pos.factor+age+sex.factor+education,data=df_sel)
+summary(mdl)
+plot_model(mdl, type='emm', terms='cdr.factor.trinarized')
+```
+
+Linear model for CBF precuneus/CBF putamen. Plot for interaction effects.
+```{r}
+mdl <- lm((asl.rest.pcu.precuneus.hct/asl.rest.putamen.hct)~cdr.factor.trinarized*apoe4pos.factor+age+sex.factor+education,data=df_sel)
+summary(mdl)
+plot_model(mdl, type='int')
+```
+
+Linear model for CBF precuneus/CBF precentral gyrus. Plot for main effects.
+```{r}
+mdl <- lm((asl.rest.pcu.precuneus.hct/asl.rest.prg.precentral.gyrus.hct)~cdr.factor.trinarized+apoe4pos.factor+age+sex.factor+education,data=df_sel)
+summary(mdl)
+plot_model(mdl, type='emm', terms='cdr.factor.trinarized')
+```
+
+Linear model for CBF precuneus/CBF precentral gyrus. Plot for interaction effects.
+```{r}
+mdl <- lm((asl.rest.pcu.precuneus.hct/asl.rest.prg.precentral.gyrus.hct)~cdr.factor.trinarized*apoe4pos.factor+age+sex.factor+education,data=df_sel)
+summary(mdl)
+plot_model(mdl, type='int')
+```
+
+Linear model with Thomas et al. ROIs with CBF putamen residualization. Plot for main effects.
+```{r}
+ROIs <- c("asl.rest.grey.matter.hct", "asl.rest.pcu.precuneus.hct", "asl.rest.prg.precentral.gyrus.hct", "asl.rest.hippocampus.hct",
+          "asl.rest.itg.inferior.temporal.gyrus.hct",
+          "asl.rest.po.parietal.operculum.hct", "asl.rest.morg.medial.orbital.gyrus.hct",
+          "asl.rest.mfg.middle.frontal.gyrus.hct")
+
+for (roi in ROIs) {
+  formula <- as.formula(paste(roi, "~ cdr.factor.trinarized + age + sex.factor + education + asl.rest.putamen.hct + apoe4pos.factor"))
+  mdl <- lm(formula, data = df_sel)  # Replace 'your_data' with your actual dataset
+  print(summary(mdl))
+  print(plot_model(mdl, type='emm', terms='cdr.factor.trinarized'))
+}
+```
+
+Linear model with Thomas et al. ROIs with CBF putamen residualization. Plot for interaction effects.
+```{r}
+ROIs <- c("asl.rest.grey.matter.hct", "asl.rest.pcu.precuneus.hct", "asl.rest.prg.precentral.gyrus.hct", "asl.rest.hippocampus.hct",
+          "asl.rest.itg.inferior.temporal.gyrus.hct",
+          "asl.rest.po.parietal.operculum.hct", "asl.rest.morg.medial.orbital.gyrus.hct",
+          "asl.rest.mfg.middle.frontal.gyrus.hct")
+
+for (roi in ROIs) {
+  formula <- as.formula(paste(roi, "~ cdr.factor.trinarized*apoe4pos.factor + age + sex.factor + education + asl.rest.putamen.hct"))
+  mdl <- lm(formula, data = df_sel)  # Replace 'your_data' with your actual dataset
+  print(summary(mdl))
+  print(plot_model(mdl, type='int'))
+}
+```
+
+Linear model with Thomas et al. ROIs without CBF putamen residualization. Plot for main effects.
+```{r}
+ROIs <- c("asl.rest.grey.matter.hct", "asl.rest.pcu.precuneus.hct", "asl.rest.prg.precentral.gyrus.hct", "asl.rest.hippocampus.hct",
+          "asl.rest.itg.inferior.temporal.gyrus.hct",
+          "asl.rest.po.parietal.operculum.hct", "asl.rest.morg.medial.orbital.gyrus.hct",
+          "asl.rest.mfg.middle.frontal.gyrus.hct")
+
+for (roi in ROIs) {
+  formula <- as.formula(paste(roi, "~ cdr.factor.trinarized + age + sex.factor + education + apoe4pos.factor"))
+  mdl <- lm(formula, data = df_sel)  # Replace 'your_data' with your actual dataset
+  print(summary(mdl))
+  print(plot_model(mdl, type='emm', terms='cdr.factor.trinarized'))
+}
+```
+
+Linear model with Thomas et al. ROIs without CBF putamen residualization. Plot for interaction effects.
+```{r}
+ROIs <- c("asl.rest.grey.matter.hct", "asl.rest.pcu.precuneus.hct", "asl.rest.prg.precentral.gyrus.hct", "asl.rest.hippocampus.hct",
+          "asl.rest.itg.inferior.temporal.gyrus.hct",
+          "asl.rest.po.parietal.operculum.hct", "asl.rest.morg.medial.orbital.gyrus.hct",
+          "asl.rest.mfg.middle.frontal.gyrus.hct")
+
+for (roi in ROIs) {
+  formula <- as.formula(paste(roi, "~ cdr.factor.trinarized*apoe4pos.factor + age + sex.factor + education"))
+  mdl <- lm(formula, data = df_sel)  # Replace 'your_data' with your actual dataset
+  print(summary(mdl))
+  print(plot_model(mdl, type='int'))
+}
+```
+
+Linear model with Thomas et al. ROIs with CBF precentral gyrus residualization. Plot for main effects.
+```{r}
+ROIs <- c("asl.rest.grey.matter.hct", "asl.rest.pcu.precuneus.hct", "asl.rest.hippocampus.hct",
+          "asl.rest.itg.inferior.temporal.gyrus.hct",
+          "asl.rest.po.parietal.operculum.hct", "asl.rest.morg.medial.orbital.gyrus.hct",
+          "asl.rest.mfg.middle.frontal.gyrus.hct")
+
+for (roi in ROIs) {
+  formula <- as.formula(paste(roi, "~ cdr.factor.trinarized + age + sex.factor + education + asl.rest.prg.precentral.gyrus.hct + apoe4pos.factor"))
+  mdl <- lm(formula, data = df_sel)  # Replace 'your_data' with your actual dataset
+  print(summary(mdl))
+  print(plot_model(mdl, type='emm', terms='cdr.factor.trinarized'))
+}
+```
+
+Linear model with Thomas et al. ROIs with CBF precentral gyrus residualization. Plot for interaction effects.
+```{r}
+ROIs <- c("asl.rest.grey.matter.hct", "asl.rest.pcu.precuneus.hct", "asl.rest.hippocampus.hct",
+          "asl.rest.itg.inferior.temporal.gyrus.hct",
+          "asl.rest.po.parietal.operculum.hct", "asl.rest.morg.medial.orbital.gyrus.hct",
+          "asl.rest.mfg.middle.frontal.gyrus.hct")
+
+for (roi in ROIs) {
+  formula <- as.formula(paste(roi, "~ cdr.factor.trinarized*apoe4pos.factor + age + sex.factor + education + asl.rest.prg.precentral.gyrus.hct"))
+  mdl <- lm(formula, data = df_sel)  # Replace 'your_data' with your actual dataset
+  print(summary(mdl))
+  print(plot_model(mdl, type='int'))
+}
+```
+
+
+
+
