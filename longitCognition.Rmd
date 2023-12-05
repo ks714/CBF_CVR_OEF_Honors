@@ -1,0 +1,225 @@
+---
+title: "CBF and Cognition"
+author: "Krish Shah"
+date: "2023-10-21"
+output: html_document
+---
+Clear the environment and load in required packages.
+```{r}
+rm(list=ls())
+require(tidyr)
+require(dplyr)
+require(nlme)
+require(sjPlot)
+```
+
+## Filtering
+Read in latest VMAP merge.
+```{r}
+df <- readRDS("/Users/krishshah/Downloads/MAP_fm_f20230906_m20230906.rds")
+```
+
+Create variable categories.
+```{r}
+idVars <- c("map.id", "epoch")
+timeVar <- c("np.date.time")            
+usabilityVarsBase <- c("asl.rest.usable.hct")
+usabilityVarsLong <- c("asl.rest.usable.hct")
+covariates <- c("apoe4pos.factor","age",
+                 "raceethnicity.factor","fsrp.minus.age.points","sex.factor",
+                 "education","diagnosis.factor","ma.total.intracranial.vol", "cdr.factor")
+predictors <- c("asl.rest.grey.matter.hct", "asl.rest.pcu.precuneus.hct", "asl.rest.prg.precentral.gyrus.hct", "asl.rest.hippocampus.hct",
+                "asl.rest.itg.inferior.temporal.gyrus.hct",
+                "asl.rest.po.parietal.operculum.hct", "asl.rest.morg.medial.orbital.gyrus.hct",
+                "asl.rest.mfg.middle.frontal.gyrus.hct", "asl.rest.putamen.hct")
+outcomes <- c("np.bnt","np.anim","np.executive.composite","np.memory.composite")
+colsLongit <- c(idVars,timeVar,usabilityVarsLong,outcomes,"NumDays")
+allVars <- c(idVars,timeVar,usabilityVarsBase,usabilityVarsLong,covariates,predictors,outcomes)
+```
+
+Collect all of the variables of interest.
+```{r}
+df <- dplyr::select(df,all_of(allVars))
+```
+
+Calculate # of days since baseline.
+```{r}
+df$scan.date.days <- as.Date(df[,timeVar])
+startdate <- as.Date("01/01/2000","%d/%m/%Y")
+df$NumDays  <- as.numeric(difftime(df$scan.date.days,startdate ,units="days"))
+```
+
+Remove NA and create baseline dataframe.
+```{r}
+df <- filter(df, df$diagnosis.factor != "Dementia")
+df_base <- tidyr::drop_na(df)
+```
+
+Remove unusable vars and obtain first observation for df_base + resid variable for each predictor.
+```{r}
+for (usabilityVar in usabilityVarsBase){
+  print(usabilityVar)
+  df_base <- df_base[df_base[usabilityVar]==1,]
+}
+
+df_base<-df_base%>%
+  dplyr::group_by(map.id) %>%
+  dplyr::arrange(epoch,.by_group = TRUE) %>% 
+  dplyr::filter(row_number()==1)
+
+for (pred in predictors) {
+  pred_base <- paste(pred, ".resid", sep = "")
+  formula <- as.formula(paste(pred, "~ I(asl.rest.putamen.hct)", sep = ""))
+  df_base[[pred_base]] <- residuals(lm(formula, data = df_base, na.action = na.exclude))
+}
+```
+
+Create longitudinal dataframe, drop NAs, and remove unusable vars.
+```{r}
+df_longit <- dplyr::select(df,all_of(colsLongit))
+df_longit <- tidyr::drop_na(df_longit)
+
+for (usabilityVar in usabilityVarsLong){
+  print(usabilityVar)
+  df_longit <- df_longit[df_longit[usabilityVar]==1,]
+}
+```
+
+Confirm mapIDs from both df_longit and df_base are matching.
+```{r}
+df_longit <- df_longit %>% filter(map.id %in% df_base$map.id)
+```
+
+Remove first observation from df_longit.
+```{r}
+df_longit <- dplyr::anti_join(df_longit,df_base,by=c("map.id","epoch"))
+```
+
+Create final (merged) dataframe.
+```{r}
+df_merged <- plyr::rbind.fill(df_base,df_longit)
+df <- df_merged
+```
+
+Get change in days column by subtracting first observation from every subsequent observation.
+```{r}
+df <- df %>% 
+  dplyr::group_by(map.id) %>%
+  dplyr::arrange(epoch,.by_group = TRUE) %>% 
+  dplyr::mutate(diffDays = NumDays - dplyr::first(NumDays))
+```
+
+.base for all covariates and predictors + diffYr variable.
+```{r}
+predictors_resid <- c("asl.rest.grey.matter.hct.resid", "asl.rest.pcu.precuneus.hct.resid", "asl.rest.prg.precentral.gyrus.hct.resid", "asl.rest.hippocampus.hct.resid",
+                "asl.rest.itg.inferior.temporal.gyrus.hct.resid",
+                "asl.rest.po.parietal.operculum.hct.resid", "asl.rest.morg.medial.orbital.gyrus.hct.resid",
+                "asl.rest.mfg.middle.frontal.gyrus.hct.resid", "asl.rest.putamen.hct.resid")
+for (covar in c(covariates,predictors,predictors_resid)){
+  covar_base <-paste(covar,".base",sep="")
+  df <- df %>% 
+    dplyr::group_by(map.id) %>%
+    dplyr::arrange(epoch,.by_group = TRUE) %>% 
+    dplyr::mutate( !!covar_base := dplyr::first(get(covar)))
+}
+df$diffYr <- df$diffDays/365.25
+
+```
+
+## Modeling
+Linear mixed effects model for longitudinal EF without residualization using precuneus CBF.
+```{r}
+ctrl <- lmeControl(msMaxIter = 100000, opt="optim")
+mdl1 <- lme(np.executive.composite~diagnosis.factor.base+asl.rest.pcu.precuneus.hct.base*diffYr+apoe4pos.factor.base+fsrp.minus.age.points.base+
+              age.base+sex.factor.base+education.base+
+              raceethnicity.factor.base, random=~1+diffYr | map.id, na.action=na.omit, 
+            control=ctrl, data=df)
+summary(mdl1)
+plot_model(mdl1, type="eff",terms=c("diffYr","asl.rest.pcu.precuneus.hct.base"))
+```
+
+Linear mixed effects model for longitudinal EF with residualization using precuneus CBF.
+```{r}
+ctrl <- lmeControl(msMaxIter = 100000, opt="optim")
+mdl1 <- lme(np.executive.composite~diagnosis.factor.base+asl.rest.pcu.precuneus.hct.resid.base*diffYr+apoe4pos.factor.base+fsrp.minus.age.points.base+
+              age.base+sex.factor.base+education.base+
+              raceethnicity.factor.base, random=~1+diffYr | map.id, na.action=na.omit, 
+            control=ctrl, data=df)
+summary(mdl1)
+plot_model(mdl1, type="eff",terms=c("diffYr","asl.rest.pcu.precuneus.hct.resid.base"))
+```
+
+Linear mixed effects model for longitudinal EF with residualization using precuneus CBF. Plot for interaction effects.
+```{r}
+ctrl <- lmeControl(msMaxIter = 100000, opt="optim")
+mdl1 <- lme(np.executive.composite~diffYr*asl.rest.pcu.precuneus.hct.resid.base*diagnosis.factor.base+apoe4pos.factor.base+fsrp.minus.age.points.base+
+            age.base+sex.factor.base+education.base+
+            raceethnicity.factor.base, random=~1+diffYr | map.id, na.action=na.omit, 
+            control=ctrl, data=df)
+summary(mdl1)
+plot_model(mdl1, type="int")
+```
+
+Linear mixed effects model for longitudinal EF with residualization using precuneus CBF. Plot for interaction effects.
+```{r}
+ctrl <- lmeControl(msMaxIter = 100000, opt="optim")
+mdl1 <- lme(np.executive.composite~diffYr*asl.rest.pcu.precuneus.hct.resid.base*apoe4pos.factor.base+fsrp.minus.age.points.base+diagnosis.factor.base+
+            age.base+sex.factor.base+education.base+
+            raceethnicity.factor.base, random=~1+diffYr | map.id, na.action=na.omit, 
+            control=ctrl, data=df)
+summary(mdl1)
+plot_model(mdl1, type="int")
+```
+
+Linear mixed effects model for longitudinal EF with residualization using precuneus CBF. Plot for interaction effects.
+```{r}
+ctrl <- lmeControl(msMaxIter = 100000, opt="optim")
+mdl1 <- lme(np.executive.composite~diffYr*asl.rest.pcu.precuneus.hct.resid.base*apoe4pos.factor.base+fsrp.minus.age.points.base+diagnosis.factor.base+
+            age.base+sex.factor.base+education.base+
+            raceethnicity.factor.base, random=~1+diffYr | map.id, na.action=na.omit, 
+            control=ctrl, data=df)
+summary(mdl1)
+plot_model(mdl1, terms=c("diffYr","asl.rest.pcu.precuneus.hct.resid.base","apoe4pos.factor.base"), type = "eff")
+```
+
+Linear mixed effects model for longitudinal memory with residualization using precuneus CBF. Plot for interaction effects.
+```{r}
+ctrl <- lmeControl(msMaxIter = 100000, opt="optim")
+mdl1 <- lme(np.memory.composite~diffYr*asl.rest.pcu.precuneus.hct.resid.base*age.base+apoe4pos.factor.base+fsrp.minus.age.points.base+diagnosis.factor.base+sex.factor.base+education.base+
+            raceethnicity.factor.base, random=~1+diffYr | map.id, na.action=na.omit, 
+            control=ctrl, data=df)
+summary(mdl1)
+plot_model(mdl1, terms = c("diffYr", "asl.rest.pcu.precuneus.hct.resid.base", "age.base"),
+           type = "eff")
+```
+
+Linear mixed effects model for longitudinal EF with and without residualization using precuneus CBF.
+```{r}
+ctrl <- lmeControl(msMaxIter = 100000, opt="optim")
+mdl1 <- lme(np.executive.composite~diagnosis.factor.base+asl.rest.pcu.precuneus.hct.resid.base*diffYr+apoe4pos.factor.base+fsrp.minus.age.points.base+
+              age.base+sex.factor.base+education.base+
+              raceethnicity.factor.base, random=~1+diffYr | map.id, na.action=na.omit, 
+            control=ctrl, data=df)
+mdl2 <- lme(np.executive.composite~diagnosis.factor.base+asl.rest.pcu.precuneus.hct.base*diffYr+apoe4pos.factor.base+fsrp.minus.age.points.base+
+              age.base+sex.factor.base+education.base+
+              raceethnicity.factor.base, random=~1+diffYr | map.id, na.action=na.omit, 
+            control=ctrl, data=df)
+mdl3 <- lme(np.executive.composite~diagnosis.factor.base+(asl.rest.pcu.precuneus.hct.base/asl.rest.putamen.hct.base)*diffYr+apoe4pos.factor.base+fsrp.minus.age.points.base+
+              age.base+sex.factor.base+education.base+
+              raceethnicity.factor.base, random=~1+diffYr | map.id, na.action=na.omit, 
+            control=ctrl, data=df)
+anova(mdl3,mdl2, mdl1)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
